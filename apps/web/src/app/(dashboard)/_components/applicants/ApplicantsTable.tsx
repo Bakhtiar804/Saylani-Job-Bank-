@@ -3,13 +3,13 @@
 import { APPLICANT_STATUSES, IDENTITY_STATUSES, type PaginationMeta } from '@jobbank/shared';
 import { Contact } from 'lucide-react';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
-import { Select, StatusPill } from '@/components/atoms';
-import { EmptyState, SearchBar } from '@/components/molecules';
+import { Input, Select, StatusPill } from '@/components/atoms';
+import { EmptyState, FormField, SearchBar } from '@/components/molecules';
 import { DataTable, type SortState } from '@/components/organisms';
 import type { SelectOption } from '@/components/atoms';
 import type { ApplicantListItem } from '@/domains/applicant';
 import { formatDate } from '@/lib/format/date';
-import { APPLICANT_STATUS_PILL, IDENTITY_PILL } from './labels';
+import { APPLICANT_STATUS_PILL, IDENTITY_PILL, REGISTRATION_SOURCE_LABELS } from './labels';
 
 interface Props {
   rows: ApplicantListItem[];
@@ -18,9 +18,10 @@ interface Props {
   /** Shown only when the viewer can see more than one branch. */
   branches: SelectOption[];
   skills: SelectOption[];
+  creators: SelectOption[];
 }
 
-export function ApplicantsTable({ rows, meta, sort, branches, skills }: Props) {
+export function ApplicantsTable({ rows, meta, sort, branches, skills, creators }: Props) {
   const router = useRouter();
   const pathname = usePathname();
   const params = useSearchParams();
@@ -49,7 +50,7 @@ export function ApplicantsTable({ rows, meta, sort, branches, skills }: Props) {
             className="w-full sm:max-w-xs"
             defaultValue={params.get('q') ?? ''}
             onSearch={(q) => update({ q: q || null })}
-            placeholder="Name, CNIC or mobile…"
+            placeholder="Name, reference, added by, CNIC or mobile…"
             label="Search applicants"
           />
           <Select
@@ -79,6 +80,49 @@ export function ApplicantsTable({ rows, meta, sort, branches, skills }: Props) {
             placeholder="Any skill"
             options={skills}
           />
+          <Select
+            aria-label="Filter by added by"
+            wrapperClassName="w-full sm:w-52"
+            value={params.get('creatorId') ?? ''}
+            onChange={(e) => update({ creatorId: e.target.value || null })}
+            placeholder="Any creator"
+            options={[{ value: 'NOT_RECORDED', label: 'Not recorded' }, ...creators]}
+          />
+          <Select
+            aria-label="Filter by registration source"
+            wrapperClassName="w-full sm:w-52"
+            value={params.get('registrationSource') ?? ''}
+            onChange={(e) => update({ registrationSource: e.target.value || null })}
+            placeholder="Any source"
+            options={Object.entries(REGISTRATION_SOURCE_LABELS).map(([value, label]) => ({
+              value,
+              label,
+            }))}
+          />
+          <FormField
+            id="applicant-registered-from"
+            label="Registered from"
+            hint="Pakistan time"
+            className="w-full sm:w-44"
+          >
+            <Input
+              type="date"
+              value={params.get('registeredFrom') ?? ''}
+              onChange={(e) => update({ registeredFrom: e.target.value || null })}
+            />
+          </FormField>
+          <FormField
+            id="applicant-registered-through"
+            label="Registered through"
+            hint="Pakistan time"
+            className="w-full sm:w-44"
+          >
+            <Input
+              type="date"
+              value={params.get('registeredTo') ?? ''}
+              onChange={(e) => update({ registeredTo: e.target.value || null })}
+            />
+          </FormField>
           {branches.length > 1 && (
             <Select
               aria-label="Filter by branch"
@@ -113,6 +157,17 @@ export function ApplicantsTable({ rows, meta, sort, branches, skills }: Props) {
           cell: (r) => (
             <div className="grid min-w-0">
               <span className="truncate font-medium">{r.fullName}</span>
+              <span className="text-fg-subtle text-xs break-all">Reference: {r.id}</span>
+              <span className="text-fg-muted text-xs">
+                {REGISTRATION_SOURCE_LABELS[r.registrationSource ?? 'NOT_RECORDED']} ·{' '}
+                {formatDate(r.createdAt)}
+              </span>
+              <span className="text-fg-muted text-xs">
+                Added by: {r.registeredByName ?? 'Not recorded'}
+              </span>
+              <span className="text-fg-muted text-xs">
+                Registration branch: {r.registrationBranchName ?? 'Not recorded'}
+              </span>
               <span className="text-fg-subtle numeric truncate text-xs">
                 {r.cnicMasked}
                 {r.phoneMasked ? ` · ${r.phoneMasked}` : ''}

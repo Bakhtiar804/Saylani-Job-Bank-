@@ -3,9 +3,17 @@ import { schema } from '@jobbank/db';
 import { and, desc, eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { runCommand } from '@/domains/shared/audit';
-import { ConflictError, ForbiddenError, NotFoundError } from '@/domains/shared/errors';
-import { assertCityAccess, assertPermission, type Actor } from '@/domains/shared/scope';
+import {
+  ConflictError,
+  ForbiddenError,
+  NotFoundError,
+  ValidationError,
+  isUniqueViolation,
+} from '@/domains/shared/errors';
+import { assertCityAccess, assertPermission, cityScope, type Actor } from '@/domains/shared/scope';
 import { db } from '@/lib/db';
+import { getAssistedMatchState } from '@/domains/matching';
+
 import { createNotification, notifyCompanyEmployers } from '@/domains/notifications';
 import type { RequestContext } from '@/domains/shared/audit';
 export type ApplicationStatus =
@@ -62,6 +70,7 @@ export const shortlistSchema = z.object({
   applicantId: z.uuid(),
   jobId: z.uuid(),
   note: z.string().trim().max(500).optional(),
+  consent: z.boolean().optional(),
 });
 export type ShortlistInput = z.infer<typeof shortlistSchema>;
 
@@ -133,6 +142,30 @@ async function buildView(row: typeof ap.$inferSelect): Promise<ApplicationView> 
   };
 }
 
+/** Existing staff scope is checked against the record and its current owners. */
+export async function assertApplicationAccess(
+  actor: Actor,
+  row: Pick<typeof ap.$inferSelect, 'id' | 'branchId' | 'applicantId' | 'jobId'>,
+) {
+  await assertCityAccess(actor, row.branchId, { entityType: 'application', entityId: row.id });
+  const [[applicant], [job]] = await Promise.all([
+    db
+      .select({ branchId: schema.applicants.branchId })
+      .from(schema.applicants)
+      .where(eq(schema.applicants.id, row.applicantId)),
+    db
+      .select({ branchId: schema.jobs.branchId })
+      .from(schema.jobs)
+      .where(eq(schema.jobs.id, row.jobId)),
+  ]);
+  if (!applicant || !job) throw new NotFoundError('Application target', row.id);
+  await assertCityAccess(actor, applicant.branchId, {
+    entityType: 'applicant',
+    entityId: row.applicantId,
+  });
+  await assertCityAccess(actor, job.branchId, { entityType: 'job', entityId: row.jobId });
+}
+
 // ─── Commands ─────────────────────────────────────────────────────────────
 
 /** Staff or Branch Admin: shortlist an applicant for a specific job. */
@@ -144,7 +177,7 @@ export async function shortlistApplicant(
 
   // Verify applicant exists and actor has city access
   const [applicantRow] = await db
-    .select({ id: schema.applicants.id, branchId: schema.applicants.branchId })
+    .select()
     .from(schema.applicants)
     .where(eq(schema.applicants.id, input.applicantId));
   if (!applicantRow) throw new NotFoundError('Applicant', input.applicantId);
@@ -154,14 +187,16 @@ export async function shortlistApplicant(
   });
 
   // Verify job exists and is open
-  const [jobRow] = await db
-    .select({ id: schema.jobs.id, branchId: schema.jobs.branchId, status: schema.jobs.status })
-    .from(schema.jobs)
-    .where(eq(schema.jobs.id, input.jobId));
+  const [jobRow] = await db.select().from(schema.jobs).where(eq(schema.jobs.id, input.jobId));
   if (!jobRow) throw new NotFoundError('Job', input.jobId);
   if (jobRow.status !== 'OPEN')
     throw new ForbiddenError('Only OPEN jobs can receive shortlisted candidates');
 
+  await assertCityAccess(ctx.actor, jobRow.branchId, { entityType: 'job', entityId: jobRow.id });
+  if (applicantRow.registrationSource === 'STAFF_ASSISTED' && input.consent !== true)
+    throw new ValidationError([
+      { path: 'consent', message: 'Obtain applicant consent for the selected job' },
+    ]);
   // Check for duplicate
   const [existing] = await db
     .select({ id: ap.id })
@@ -169,13 +204,43 @@ export async function shortlistApplicant(
     .where(and(eq(ap.applicantId, input.applicantId), eq(ap.jobId, input.jobId)));
   if (existing) throw new ConflictError('This applicant is already shortlisted for this job');
 
+  let submissionJob = jobRow;
   return runCommand(ctx, async ({ tx, audit }) => {
+    const [freshApplicant] = await tx
+      .select()
+      .from(schema.applicants)
+      .where(eq(schema.applicants.id, input.applicantId))
+      .for('update');
+    if (!freshApplicant) throw new NotFoundError('Applicant', input.applicantId);
+    if (freshApplicant.registrationSource === 'STAFF_ASSISTED') {
+      const [freshJob] = await tx
+        .select()
+        .from(schema.jobs)
+        .where(eq(schema.jobs.id, input.jobId))
+        .for('share');
+      if (!freshJob) throw new NotFoundError('Job', input.jobId);
+      submissionJob = freshJob;
+      await assertCityAccess(ctx.actor, freshApplicant.branchId, {
+        entityType: 'applicant',
+        entityId: freshApplicant.id,
+      });
+      await assertCityAccess(ctx.actor, freshJob.branchId, {
+        entityType: 'job',
+        entityId: freshJob.id,
+      });
+      const eligibility = await getAssistedMatchState(tx, freshApplicant, freshJob);
+      if (!eligibility.eligible)
+        throw new ConflictError(
+          'An active profile, open job and current eligible matching result are required',
+          { matchingStatus: eligibility.status },
+        );
+    }
     const [row] = await tx
       .insert(ap)
       .values({
         applicantId: input.applicantId,
         jobId: input.jobId,
-        branchId: jobRow.branchId,
+        branchId: submissionJob.branchId,
         createdBy: ctx.actor.userId,
         note: input.note ?? null,
         status: 'SHORTLISTED',
@@ -183,13 +248,28 @@ export async function shortlistApplicant(
       .returning();
 
     audit({
+      metadata:
+        freshApplicant.registrationSource === 'STAFF_ASSISTED'
+          ? {
+              applicantId: input.applicantId,
+              jobId: jobRow.id,
+              jobTitle: submissionJob.title,
+              consent: { accepted: true, version: 'assisted-application-v1' },
+            }
+          : undefined,
       action: 'application.shortlist',
       entityType: 'application',
       entityId: row!.id,
-      branchId: jobRow.branchId,
+      branchId: submissionJob.branchId,
     });
     return row!;
-  }).then(buildView);
+  })
+    .then(buildView)
+    .catch((error) => {
+      if (isUniqueViolation(error, 'applications_applicant_job_uq'))
+        throw new ConflictError('This applicant is already shortlisted for this job');
+      throw error;
+    });
 }
 
 /** Branch Admin only: schedule a Job Bank interview for an application. */
@@ -202,6 +282,7 @@ export async function scheduleInterview(
 
   const [row] = await db.select().from(ap).where(eq(ap.id, applicationId));
   if (!row) throw new NotFoundError('Application', applicationId);
+  await assertApplicationAccess(ctx.actor, row);
 
   if (row.status === 'REJECTED' || row.status === 'HIRED')
     throw new ForbiddenError('Cannot schedule an interview for a closed application');
@@ -240,6 +321,7 @@ export async function updateInterviewStatus(
 
   const [row] = await db.select().from(ap).where(eq(ap.id, applicationId));
   if (!row) throw new NotFoundError('Application', applicationId);
+  await assertApplicationAccess(ctx.actor, row);
 
   const interviewStatuses: ApplicationStatus[] = [
     'INTERVIEW_SCHEDULED',
@@ -291,7 +373,7 @@ async function notifyApplicantOfInterviewUpdate(
     .from(schema.applicants)
     .where(eq(schema.applicants.id, applicantId))
     .limit(1);
-  if (!applicantRow) return;
+  if (!applicantRow?.userId) return;
 
   type NotifType = 'INTERVIEW_POSTPONED' | 'INTERVIEW_CANCELLED' | 'INTERVIEW_RESCHEDULED';
   const copy: Record<NotifType, { title: string; body: string }> = {
@@ -348,6 +430,7 @@ export async function referApplicantToEmployer(
 
   const [row] = await db.select().from(ap).where(eq(ap.id, applicationId));
   if (!row) throw new NotFoundError('Application', applicationId);
+  await assertApplicationAccess(ctx.actor, row);
 
   const referable: ApplicationStatus[] = [
     'SHORTLISTED',
@@ -405,7 +488,7 @@ async function notifyReferral(
     .limit(1);
 
   await Promise.all([
-    applicantRow
+    applicantRow?.userId
       ? createNotification(db, {
           userId: applicantRow.userId,
           type: 'APPLICANT_REFERRED',
@@ -439,12 +522,28 @@ export async function listApplicationsForApplicant(
   applicantId: string,
 ): Promise<ApplicationView[]> {
   assertPermission(actor, 'match_case:read');
-  const rows = await db
+  const [applicant] = await db
     .select()
+    .from(schema.applicants)
+    .where(eq(schema.applicants.id, applicantId));
+  if (!applicant) throw new NotFoundError('Applicant', applicantId);
+  await assertCityAccess(actor, applicant.branchId, {
+    entityType: 'applicant',
+    entityId: applicant.id,
+  });
+  const rows = await db
+    .select({ application: ap })
     .from(ap)
-    .where(eq(ap.applicantId, applicantId))
+    .innerJoin(schema.jobs, eq(schema.jobs.id, ap.jobId))
+    .where(
+      and(
+        eq(ap.applicantId, applicantId),
+        cityScope(actor, ap.branchId),
+        cityScope(actor, schema.jobs.branchId),
+      ),
+    )
     .orderBy(desc(ap.createdAt));
-  return Promise.all(rows.map(buildView));
+  return Promise.all(rows.map(({ application }) => buildView(application)));
 }
 
 /** List applications visible to the signed-in applicant (their own). */
@@ -466,3 +565,26 @@ export async function listMyApplications(actor: Actor): Promise<ApplicationView[
 export { buildView };
 
 export * from './employer';
+
+/** Current stored eligibility for the assisted shortlist confirmation. No Python RPC. */
+export async function getAssistedApplicationStatus(
+  actor: Actor,
+  applicantId: string,
+  jobId: string,
+) {
+  assertPermission(actor, 'match_case:manage');
+  assertPermission(actor, 'applicant:read');
+  const [applicant] = await db
+    .select()
+    .from(schema.applicants)
+    .where(eq(schema.applicants.id, applicantId));
+  if (!applicant) throw new NotFoundError('Applicant', applicantId);
+  await assertCityAccess(actor, applicant.branchId, {
+    entityType: 'applicant',
+    entityId: applicant.id,
+  });
+  const [job] = await db.select().from(schema.jobs).where(eq(schema.jobs.id, jobId));
+  if (!job) throw new NotFoundError('Job', jobId);
+  await assertCityAccess(actor, job.branchId, { entityType: 'job', entityId: job.id });
+  return { ...(await getAssistedMatchState(db, applicant, job)), jobTitle: job.title };
+}

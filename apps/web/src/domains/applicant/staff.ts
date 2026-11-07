@@ -13,6 +13,7 @@ import {
 } from '@jobbank/shared';
 import { and, asc, count, desc, eq, exists, ilike, inArray, or, sql, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
+import { alias } from 'drizzle-orm/pg-core';
 import { isPlaceholderEmail, placeholderEmailFor } from '@/domains/auth';
 import { getBranchContact, type BranchContact } from '@/domains/branch';
 import { masterDataLabels } from '@/domains/settings';
@@ -28,6 +29,7 @@ import { maskCnic, maskPhone } from '@/domains/shared/masking';
 import { paginationMeta, type ListQuery } from '@/domains/shared/pagination';
 import {
   assertCityAccess,
+  cityScope,
   assertPermission,
   hasPermission,
   isSuperAdmin,
@@ -56,7 +58,14 @@ import {
 
 export const APPLICANT_SORTABLE = ['fullName', 'createdAt', 'profileCompleteness'] as const;
 
+const creator = alias(schema.users, 'applicant_creator');
+const registrationBranch = alias(schema.branches, 'registration_branch');
+
 export const applicantFilters = {
+  creatorId: z.union([z.uuid(), z.literal('NOT_RECORDED')]).optional(),
+  registrationSource: z.enum(['SELF', 'STAFF_ASSISTED', 'NOT_RECORDED']).optional(),
+  registeredFrom: z.iso.date().optional(),
+  registeredTo: z.iso.date().optional(),
   status: z.enum(APPLICANT_STATUSES).optional(),
   identityStatus: z.enum(IDENTITY_STATUSES).optional(),
   branchId: z.uuid().optional(),
@@ -65,7 +74,13 @@ export const applicantFilters = {
   skillCode: masterDataCodeSchema.optional(),
 };
 
-export interface ApplicantListItem {
+export interface ApplicantAttribution {
+  registrationSource: 'SELF' | 'STAFF_ASSISTED' | null;
+  registeredByName: string | null;
+  registrationBranchName: string | null;
+}
+
+export interface ApplicantListItem extends ApplicantAttribution {
   id: string;
   fullName: string;
   /** "42101-•••••••-1": lists never show the full CNIC. */
@@ -80,6 +95,22 @@ export interface ApplicantListItem {
   createdAt: string;
 }
 
+/** The same visibility predicate is used for records, totals and creator options. */
+function applicantVisibility(actor: Actor): SQL | undefined {
+  return cityScope(actor, a.branchId);
+}
+
+export async function listApplicantCreators(actor: Actor) {
+  assertPermission(actor, 'applicant:read');
+  return db
+    .selectDistinct({ id: creator.id, name: creator.name })
+    .from(a)
+    .innerJoin(creator, eq(creator.id, a.registeredByUserId))
+    .leftJoin(addr, eq(addr.applicantId, a.id))
+    .where(applicantVisibility(actor))
+    .orderBy(asc(creator.name), asc(creator.id));
+}
+
 export async function listApplicants(
   actor: Actor,
   query: ListQuery<
@@ -91,6 +122,10 @@ export async function listApplicants(
       cityCode?: string;
       areaCode?: string;
       skillCode?: string;
+      creatorId?: string;
+      registrationSource?: 'SELF' | 'STAFF_ASSISTED' | 'NOT_RECORDED';
+      registeredFrom?: string;
+      registeredTo?: string;
     }
   >,
 ) {
@@ -104,25 +139,35 @@ export async function listApplicants(
     });
   }
 
-  // City-based scoping: staff see all applicants whose city matches any city of their branches.
-  const cityScope: SQL | undefined = isSuperAdmin(actor)
-    ? undefined
-    : actor.branchIds.length === 0
-      ? sql`false`
-      : exists(
-          db
-            .select({ one: sql`1` })
-            .from(schema.branches)
-            .where(
-              and(
-                inArray(schema.branches.id, actor.branchIds),
-                sql`upper(${schema.branches.city}) = upper(${addr.cityCode})`,
-              ),
-            ),
-        );
-
+  if (f.registeredFrom && f.registeredTo && f.registeredFrom > f.registeredTo)
+    throw new ValidationError([
+      { path: 'registeredTo', message: 'End date must be on or after start date' },
+    ]);
+  if (
+    f.creatorId &&
+    f.creatorId !== 'NOT_RECORDED' &&
+    !(await listApplicantCreators(actor)).some((c) => c.id === f.creatorId)
+  )
+    throw new ScopeViolationError(undefined, { entityType: 'applicant' });
   const conditions: (SQL | undefined)[] = [
-    cityScope,
+    applicantVisibility(actor),
+    f.creatorId
+      ? f.creatorId === 'NOT_RECORDED'
+        ? sql`${a.registeredByUserId} is null`
+        : eq(a.registeredByUserId, f.creatorId)
+      : undefined,
+    f.registrationSource
+      ? f.registrationSource === 'NOT_RECORDED'
+        ? sql`${a.registrationSource} is null`
+        : eq(a.registrationSource, f.registrationSource)
+      : undefined,
+    // Calendar boundaries use Pakistan time; end date includes the entire selected day.
+    f.registeredFrom
+      ? sql`${a.createdAt} >= (${f.registeredFrom}::date::timestamp at time zone 'Asia/Karachi')`
+      : undefined,
+    f.registeredTo
+      ? sql`${a.createdAt} < ((${f.registeredTo}::date + 1)::timestamp at time zone 'Asia/Karachi')`
+      : undefined,
     f.status ? eq(a.status, f.status) : undefined,
     f.identityStatus ? eq(a.identityStatus, f.identityStatus) : undefined,
     f.branchId ? eq(a.branchId, f.branchId) : undefined,
@@ -137,15 +182,19 @@ export async function listApplicants(
         )
       : undefined,
   ];
-  if (query.q) {
+  if (query.q && z.uuid().safeParse(query.q).success) {
+    conditions.push(eq(a.id, query.q));
+  } else if (query.q) {
     // Names by substring; CNIC and phone by their digits (staff often have only one of them).
     const digits = query.q.replace(/\D/g, '');
     const phone = digits.length >= 10 ? normalizePkMobile(digits) : null;
     conditions.push(
       or(
+        ilike(creator.name, `%${query.q}%`),
+        sql`${a.id}::text = ${query.q}`,
         ilike(a.fullName, `%${query.q}%`),
         digits.length >= 5 ? sql`${a.cnic} like ${`${digits}%`}` : undefined,
-        phone ? eq(schema.users.phoneNumber, phone) : undefined,
+        phone ? or(eq(schema.users.phoneNumber, phone), eq(a.contactPhone, phone)) : undefined,
       ),
     );
   }
@@ -162,18 +211,23 @@ export async function listApplicants(
         id: a.id,
         fullName: a.fullName,
         cnic: a.cnic,
-        phone: schema.users.phoneNumber,
+        phone: sql<string | null>`coalesce(${a.contactPhone}, ${schema.users.phoneNumber})`,
         status: a.status,
         identityStatus: a.identityStatus,
         profileCompleteness: a.profileCompleteness,
         branchName: schema.branches.name,
+        registrationSource: a.registrationSource,
+        registeredByName: creator.name,
+        registrationBranchName: registrationBranch.name,
         cityCode: addr.cityCode,
         areaCode: addr.areaCode,
         createdAt: a.createdAt,
       })
       .from(a)
-      .innerJoin(schema.users, eq(schema.users.id, a.userId))
+      .leftJoin(schema.users, eq(schema.users.id, a.userId))
+      .leftJoin(creator, eq(creator.id, a.registeredByUserId))
       .leftJoin(schema.branches, eq(schema.branches.id, a.branchId))
+      .leftJoin(registrationBranch, eq(registrationBranch.id, a.registrationBranchId))
       .leftJoin(addr, eq(addr.applicantId, a.id));
 
   const [rows, [total], labels] = await Promise.all([
@@ -185,7 +239,8 @@ export async function listApplicants(
     db
       .select({ value: count() })
       .from(a)
-      .innerJoin(schema.users, eq(schema.users.id, a.userId))
+      .leftJoin(schema.users, eq(schema.users.id, a.userId))
+      .leftJoin(creator, eq(creator.id, a.registeredByUserId))
       .leftJoin(addr, eq(addr.applicantId, a.id))
       .where(where),
     masterDataLabels(['CITY', 'AREA']),
@@ -201,6 +256,9 @@ export async function listApplicants(
       identityStatus: row.identityStatus,
       profileCompleteness: row.profileCompleteness,
       branchName: row.branchName,
+      registrationSource: row.registrationSource,
+      registeredByName: row.registeredByName,
+      registrationBranchName: row.registrationBranchName,
       cityLabel: row.cityCode ? (labels.CITY?.[row.cityCode] ?? row.cityCode) : null,
       areaLabel: row.areaCode ? (labels.AREA?.[row.areaCode] ?? row.areaCode) : null,
       createdAt: row.createdAt.toISOString(),
@@ -222,8 +280,8 @@ export interface IdentityCheckView {
   cnicMatchesCurrent: boolean;
 }
 
-export interface ApplicantStaffView extends ApplicantProfile {
-  userId: string;
+export interface ApplicantStaffView extends ApplicantProfile, ApplicantAttribution {
+  userId: string | null;
   statusReason: string | null;
   identityHistory: IdentityCheckView[];
   /** What the signed-in staff member may do (drives the UI). */
@@ -249,7 +307,13 @@ export async function getApplicantForStaff(
 ): Promise<ApplicantStaffView> {
   assertPermission(actor, 'applicant:read');
   const row = await scopedApplicant(actor, applicantId);
-  const [profile, history] = await Promise.all([
+  const [[attribution], profile, history] = await Promise.all([
+    db
+      .select({ registeredByName: creator.name, registrationBranchName: registrationBranch.name })
+      .from(a)
+      .leftJoin(creator, eq(creator.id, a.registeredByUserId))
+      .leftJoin(registrationBranch, eq(registrationBranch.id, a.registrationBranchId))
+      .where(eq(a.id, row.id)),
     buildProfile(db, row),
     db
       .select({
@@ -269,6 +333,9 @@ export async function getApplicantForStaff(
   return {
     ...profile,
     userId: row.userId,
+    registrationSource: row.registrationSource,
+    registeredByName: attribution?.registeredByName ?? null,
+    registrationBranchName: attribution?.registrationBranchName ?? null,
     statusReason: row.statusReason,
     identityHistory: history.map((h) => ({
       id: h.id,
@@ -368,7 +435,7 @@ export async function verifyApplicantIdentity(
 export async function staffUpdateApplicant(
   ctx: SignedIn,
   applicantId: string,
-  input: UpdatePersonalInput & { reason: string },
+  input: UpdatePersonalInput & { reason: string; contactPhone?: string | null },
 ): Promise<ApplicantStaffView> {
   assertPermission(ctx.actor, 'applicant:manage');
   const { reason, ...fields } = input;
@@ -376,6 +443,10 @@ export async function staffUpdateApplicant(
   try {
     await runCommand(ctx, async ({ tx, audit }) => {
       const row = await loadApplicant(tx, applicantId, { forUpdate: true });
+      if (row.registrationSource === 'STAFF_ASSISTED' && fields.email !== undefined)
+        throw new ForbiddenError('Email is not part of assisted profile editing');
+      if (row.registrationSource !== 'STAFF_ASSISTED' && fields.contactPhone !== undefined)
+        throw new ForbiddenError('Use the existing account phone recovery process');
       const changes = Object.fromEntries(
         Object.entries(fields).filter(
           ([k, v]) => v !== undefined && v !== row[k as keyof ApplicantRow],
@@ -394,7 +465,7 @@ export async function staffUpdateApplicant(
           identityStatus: identityChanged ? 'UNVERIFIED' : row.identityStatus,
         })
         .where(eq(a.id, row.id));
-      if (changes.fullName) {
+      if (changes.fullName && row.userId) {
         await tx
           .update(schema.users)
           .set({ name: changes.fullName })
@@ -440,6 +511,7 @@ export async function changeApplicantPhone(
   try {
     await runCommand(ctx, async ({ tx, audit }) => {
       const row = await loadApplicant(tx, applicantId, { forUpdate: true });
+      if (!row.userId) throw new ConflictError('This applicant has no sign-in account to recover');
       const [user] = await tx.select().from(schema.users).where(eq(schema.users.id, row.userId));
       if (user!.phoneNumber === phone) throw new ConflictError('This is already their number');
       const [taken] = await tx

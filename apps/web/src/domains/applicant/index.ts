@@ -33,6 +33,7 @@ export {
   changeApplicantPhone,
   getApplicantForStaff,
   listApplicants,
+  listApplicantCreators,
   staffSetApplicantStatus,
   staffUpdateApplicant,
   transferApplicant,
@@ -41,3 +42,5 @@ export {
   type ApplicantStaffView,
   type IdentityCheckView,
 } from './staff';
+
+export { staffRegisterApplicant } from './registration';

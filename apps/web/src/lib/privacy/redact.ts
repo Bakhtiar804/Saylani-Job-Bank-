@@ -14,6 +14,7 @@ const SENSITIVE_KEYS = new Set(
     'phone',
     'mobile',
     'phoneNumber',
+    'contactPhone',
     'email',
     'dob',
     'dateOfBirth',

@@ -35,7 +35,7 @@ const timestamps = {
 const list = (values: readonly string[]) => sql.raw(values.map((v) => `'${v}'`).join(', '));
 
 /**
- * M6: one profile per applicant account (phone sign-in). The phone number stays on `users`
+ * One profile per account, or an account-less staff-assisted profile. The phone number stays on `users`
  * (it is the sign-in identity). `branch_id` is chosen at the location step; a profile can only
  * be ACTIVE (matchable) with a branch. Master-data references store the permanent `code`.
  */
@@ -44,10 +44,15 @@ export const applicants = pgTable(
   {
     id: uuid().primaryKey().defaultRandom(),
     userId: uuid()
-      .notNull()
       .unique()
       .references(() => users.id, { onDelete: 'restrict' }),
     branchId: uuid().references(() => branches.id, { onDelete: 'restrict' }),
+    /** Immutable provenance. Null means unknown for legacy records. */
+    registeredByUserId: uuid().references(() => users.id, { onDelete: 'restrict' }),
+    registrationBranchId: uuid().references(() => branches.id, { onDelete: 'restrict' }),
+    registrationSource: text({ enum: ['SELF', 'STAFF_ASSISTED'] }).default('SELF'),
+    /** Optional unverified contact; may be shared. Never a login identity. */
+    contactPhone: text(),
     fullName: text().notNull(),
     fatherName: text().notNull(),
     /** 13 digits, no dashes. Never sent to employers (PRD rule 3). */
@@ -68,6 +73,18 @@ export const applicants = pgTable(
   },
   (t) => [
     index('applicants_branch_status_idx').on(t.branchId, t.status),
+    index('applicants_registration_branch_created_idx').on(t.registrationBranchId, t.createdAt),
+    index('applicants_registered_by_idx').on(t.registeredByUserId),
+    check(
+      'applicants_registration_valid',
+      sql`((${t.registrationSource} is null and ${t.registeredByUserId} is null and ${t.registrationBranchId} is null and ${t.userId} is not null)
+      or (${t.registrationSource} = 'SELF' and ${t.userId} is not null and ${t.registeredByUserId} is null)
+      or (${t.registrationSource} = 'STAFF_ASSISTED' and ${t.registeredByUserId} is not null and ${t.registrationBranchId} is not null)) is true`,
+    ),
+    check(
+      'applicants_contact_phone_format',
+      sql`${t.contactPhone} is null or ${t.contactPhone} ~ '^[+]923[0-9]{9}$'`,
+    ),
     check('applicants_cnic_format', sql`${t.cnic} ~ '^[1-9][0-9]{12}$'`),
     check('applicants_status_valid', sql`${t.status} in (${list(APPLICANT_STATUSES)})`),
     check(

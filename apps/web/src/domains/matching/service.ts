@@ -170,6 +170,8 @@ export async function setJobMatchReviewStatus(
   }
   const job = await loadJobForActor(ctx.actor, jobId);
 
+  if (input.reviewStatus === 'HIRED' && !hasPermission(ctx.actor, 'decision:employer'))
+    throw new ForbiddenError('Employer permission is required for a hiring decision');
   const reason =
     input.reviewStatus === 'REJECTED'
       ? await requireReasonCode('REJECTION_REASON', input.reasonCode, input.note)

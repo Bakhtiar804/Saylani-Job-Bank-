@@ -338,10 +338,12 @@ export async function buildProfile(
     branch,
     completeness,
   ] = await Promise.all([
-    executor
-      .select({ phone: schema.users.phoneNumber })
-      .from(schema.users)
-      .where(eq(schema.users.id, row.userId)),
+    row.userId
+      ? executor
+          .select({ phone: schema.users.phoneNumber })
+          .from(schema.users)
+          .where(eq(schema.users.id, row.userId))
+      : Promise.resolve([]),
     executor.select().from(addr).where(eq(addr.applicantId, row.id)),
     executor.select().from(edu).where(eq(edu.applicantId, row.id)).orderBy(asc(edu.sortOrder)),
     executor.select().from(exp).where(eq(exp.applicantId, row.id)).orderBy(asc(exp.sortOrder)),
@@ -376,7 +378,7 @@ export async function buildProfile(
       dateOfBirth: row.dateOfBirth,
       gender: row.gender,
       email: row.email,
-      phone: user?.phone ?? null,
+      phone: row.contactPhone ?? user?.phone ?? null,
     },
     address: address
       ? {

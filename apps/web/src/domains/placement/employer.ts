@@ -10,7 +10,12 @@ import { assertPermission, hasPermission, type Actor } from '@/domains/shared/sc
 import { db } from '@/lib/db';
 import { createNotification, notifyCompanyEmployers } from '@/domains/notifications';
 import type { RequestContext } from '@/domains/shared/audit';
-import { buildView, type ApplicationView, type ApplicationStatus } from './index';
+import {
+  assertApplicationAccess,
+  buildView,
+  type ApplicationView,
+  type ApplicationStatus,
+} from './index';
 
 type SignedIn = RequestContext & { actor: Actor };
 
@@ -110,11 +115,13 @@ async function getApplicantSummary(applicantId: string): Promise<ApplicantSummar
       .from(schema.applicantAddresses)
       .where(eq(schema.applicantAddresses.applicantId, applicantId))
       .limit(1),
-    db
-      .select({ phone: schema.users.phoneNumber })
-      .from(schema.users)
-      .where(eq(schema.users.id, applicantRow.userId))
-      .limit(1),
+    applicantRow.userId
+      ? db
+          .select({ phone: schema.users.phoneNumber })
+          .from(schema.users)
+          .where(eq(schema.users.id, applicantRow.userId))
+          .limit(1)
+      : Promise.resolve([]),
     db
       .select({
         skillCode: schema.applicantSkills.skillCode,
@@ -297,7 +304,7 @@ export async function scheduleEmployerInterview(
     .where(eq(schema.applicants.id, row.applicantId))
     .limit(1);
 
-  if (applicantRow) {
+  if (applicantRow?.userId) {
     void createNotification(db, {
       userId: applicantRow.userId,
       type: 'INTERVIEW_RESCHEDULED',
@@ -358,7 +365,7 @@ export async function updateEmployerInterviewStatus(
     .where(eq(schema.applicants.id, row.applicantId))
     .limit(1);
 
-  if (applicantRow) {
+  if (applicantRow?.userId) {
     const [jobRow] = await db
       .select({ title: schema.jobs.title })
       .from(schema.jobs)
@@ -466,7 +473,7 @@ export async function recordEmployerDecision(
     .where(eq(schema.applicants.id, row.applicantId))
     .limit(1);
 
-  if (applicantRow) {
+  if (applicantRow?.userId) {
     type NotifType = 'OFFER_ACCEPTED' | 'OFFER_DECLINED' | 'MATCH_REJECTED';
     const notifType: NotifType =
       input.decision === 'ACCEPTED'
@@ -592,7 +599,10 @@ export async function listMessages(actor: Actor, applicationId: string): Promise
   if (!row) throw new NotFoundError('Application', applicationId);
 
   // Check access
-  const hasStaffAccess = hasPermission(actor, 'match_case:read');
+  const hasStaffAccess =
+    hasPermission(actor, 'match_case:read') &&
+    actor.roles.some((role) => ['STAFF', 'BRANCH_ADMIN', 'SUPER_ADMIN'].includes(role));
+  if (hasStaffAccess) await assertApplicationAccess(actor, row);
   const isEmployerAccess = actor.companyId != null;
   const isApplicantAccess = actor.applicantId === row.applicantId;
 
@@ -710,7 +720,7 @@ export async function sendMessage(
       .from(schema.applicants)
       .where(eq(schema.applicants.id, row.applicantId))
       .limit(1);
-    if (applicantRow) {
+    if (applicantRow?.userId) {
       void createNotification(db, {
         userId: applicantRow.userId,
         type: 'OFFER_DECLINED',

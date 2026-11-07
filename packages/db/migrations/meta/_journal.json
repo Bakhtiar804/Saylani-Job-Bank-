@@ -169,6 +169,20 @@
                         "when":  1792100004000,
                         "tag":  "0022_applicant_category_documents",
                         "breakpoints":  true
+                    },
+                    {
+                        "idx":  24,
+                        "version":  "7",
+                        "when":  1792100005000,
+                        "tag":  "0023_applicant_registration",
+                        "breakpoints":  true
+                    },
+                    {
+                        "idx":  25,
+                        "version":  "7",
+                        "when":  1792100006000,
+                        "tag":  "0024_applicant_contact",
+                        "breakpoints":  true
                     }
                 ]
 }

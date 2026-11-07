@@ -25,7 +25,7 @@ import {
 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { useState, type FormEvent, type ReactNode } from 'react';
-import { Badge, Button, Input, RadioGroup, Select, Textarea } from '@/components/atoms';
+import { Badge, Button, Checkbox, Input, RadioGroup, Select, Textarea } from '@/components/atoms';
 import type { SelectOption } from '@/components/atoms';
 import {
   CNICInput,
@@ -41,13 +41,19 @@ import type { ApplicantStaffView } from '@/domains/applicant';
 import type { ApplicationView } from '@/domains/placement';
 import { ApiClientError, apiFetch } from '@/lib/api/client';
 import { formatCnic } from '@/lib/format/cnic';
-import { formatDate } from '@/lib/format/date';
+import { formatDate, formatDateTime } from '@/lib/format/date';
 import { formatDistance } from '@/lib/format/distance';
 import { formatPkMobileDisplay } from '@/lib/format/phone';
 import { errorMessage, toFieldErrors, type FieldErrors } from './form';
-import { DOCUMENT_STATUS_PILL, IDENTITY_PILL } from './labels';
+import {
+  DOCUMENT_STATUS_PILL,
+  IDENTITY_PILL,
+  APPLICANT_STATUS_PILL,
+  REGISTRATION_SOURCE_LABELS,
+} from './labels';
 import { openDocument } from './open-document';
 import type { ProfileLabels } from './lists';
+import { AssistedMatchCheck } from './AssistedMatchCheck';
 
 function Card({
   title,
@@ -200,6 +206,7 @@ function IdentityCheckDialog({ applicant }: { applicant: ApplicantStaffView }) {
 function EditDetailsDialog({ applicant }: { applicant: ApplicantStaffView }) {
   const router = useRouter();
   const p = applicant.personal;
+  const assisted = applicant.registrationSource === 'STAFF_ASSISTED';
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState({
     fullName: p.fullName,
@@ -208,6 +215,7 @@ function EditDetailsDialog({ applicant }: { applicant: ApplicantStaffView }) {
     dateOfBirth: p.dateOfBirth,
     gender: p.gender as Gender,
     email: p.email ?? '',
+    contactPhone: p.phone ?? '',
     reason: '',
   });
   const [errors, setErrors] = useState<FieldErrors>({});
@@ -216,15 +224,27 @@ function EditDetailsDialog({ applicant }: { applicant: ApplicantStaffView }) {
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    const original: Record<string, string | null> = { ...p, email: p.email ?? '' };
+    const original: Record<string, string | null> = {
+      ...p,
+      email: p.email ?? '',
+      contactPhone: p.phone ?? '',
+    };
     const changed = Object.fromEntries(
-      Object.entries(form).filter(([k, v]) => k !== 'reason' && v !== original[k]),
+      Object.entries(form).filter(
+        ([k, v]) => k !== 'reason' && (!assisted || k !== 'email') && v !== original[k],
+      ),
     );
     setSaving(true);
     try {
       await apiFetch(`/api/v1/applicants/${applicant.id}`, {
         method: 'PATCH',
-        body: { ...changed, reason: form.reason },
+        body: {
+          ...changed,
+          ...(assisted && 'contactPhone' in changed
+            ? { contactPhone: form.contactPhone || null }
+            : {}),
+          reason: form.reason,
+        },
       });
       toast.success('Details corrected');
       setOpen(false);
@@ -279,9 +299,27 @@ function EditDetailsDialog({ applicant }: { applicant: ApplicantStaffView }) {
             options={GENDERS.map((g) => ({ value: g, label: GENDER_LABELS[g] }))}
           />
         </FormField>
-        <FormField label="Email" error={errors.email}>
-          <Input type="email" value={form.email} onChange={(e) => set({ email: e.target.value })} />
-        </FormField>
+        {!assisted && (
+          <FormField label="Email" error={errors.email}>
+            <Input
+              type="email"
+              value={form.email}
+              onChange={(e) => set({ email: e.target.value })}
+            />
+          </FormField>
+        )}
+        {assisted && (
+          <FormField
+            label="Available contact number"
+            error={errors.contactPhone}
+            hint="Optional shared contact. This does not create a login or verify the number."
+          >
+            <PhoneInput
+              value={form.contactPhone}
+              onChange={(v) => set({ contactPhone: v.e164 ?? v.national })}
+            />
+          </FormField>
+        )}
         <FormField
           label="Reason for the correction"
           required
@@ -452,6 +490,9 @@ function ShortlistDialog({
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [jobId, setJobId] = useState('');
+  const assisted = applicant.registrationSource === 'STAFF_ASSISTED';
+  const [consent, setConsent] = useState(false);
+  const [eligible, setEligible] = useState(false);
   const [note, setNote] = useState('');
   const [errors, setErrors] = useState<FieldErrors>({});
   const [saving, setSaving] = useState(false);
@@ -462,7 +503,12 @@ function ShortlistDialog({
     try {
       await apiFetch('/api/v1/applications', {
         method: 'POST',
-        body: { applicantId: applicant.id, jobId, note: note || undefined },
+        body: {
+          applicantId: applicant.id,
+          jobId,
+          note: note || undefined,
+          ...(assisted ? { consent } : {}),
+        },
       });
       toast.success('Applicant shortlisted for the job');
       setOpen(false);
@@ -493,11 +539,35 @@ function ShortlistDialog({
             <Select
               placeholder="Choose a job"
               value={jobId}
-              onChange={(e) => setJobId(e.target.value)}
+              onChange={(e) => {
+                setJobId(e.target.value);
+                setConsent(false);
+                setEligible(false);
+              }}
               options={openJobs}
             />
           )}
         </FormField>
+        {assisted && jobId && (
+          <>
+            <AssistedMatchCheck
+              key={jobId}
+              applicantId={applicant.id}
+              jobId={jobId}
+              onChange={setEligible}
+            />
+            <p className="text-fg text-sm">
+              Selected job: {openJobs.find((j) => j.value === jobId)?.label}
+            </p>
+            <FormField label="Applicant consent" required error={errors.consent}>
+              <Checkbox
+                label="The applicant agrees to be shortlisted for this selected job"
+                checked={consent}
+                onCheckedChange={(v) => setConsent(v === true)}
+              />
+            </FormField>
+          </>
+        )}
         <FormField label="Note" hint="Optional note for staff reference.">
           <Textarea rows={2} value={note} onChange={(e) => setNote(e.target.value)} />
         </FormField>
@@ -505,7 +575,11 @@ function ShortlistDialog({
           <Button variant="secondary" onClick={() => setOpen(false)} disabled={saving}>
             Cancel
           </Button>
-          <Button type="submit" loading={saving} disabled={!jobId}>
+          <Button
+            type="submit"
+            loading={saving}
+            disabled={!jobId || (assisted && (!eligible || !consent))}
+          >
             Shortlist
           </Button>
         </div>
@@ -946,12 +1020,55 @@ export function ApplicantDetailView({
         </p>
       )}
 
+      {applicant.registrationSource === 'STAFF_ASSISTED' && (
+        <Card title="Assisted workflow status">
+          {applicant.status !== 'ACTIVE' && (
+            <p className="text-fg-muted text-sm">
+              Matching and shortlisting are unavailable while this profile is not active.
+            </p>
+          )}
+          <p className="text-fg-muted text-sm">
+            Profile status: {APPLICANT_STATUS_PILL[applicant.status].label}. Registration does not
+            verify identity or submit applications. Job-specific stored matching status is checked
+            before shortlisting; live worker availability is not checked.
+          </p>
+          {!applicant.userId && (
+            <p className="text-fg-muted text-sm">
+              No applicant login account is linked. Applicant sign-in, in-app notifications and
+              online offer responses are unavailable; staff cannot record employer or applicant
+              decisions without the existing permissions.
+            </p>
+          )}
+        </Card>
+      )}
       {applicant.can.shortlist && (
         <div className="flex flex-wrap gap-2">
           <ShortlistDialog applicant={applicant} openJobs={openJobs ?? []} />
         </div>
       )}
 
+      <Card title="Registration">
+        <KeyValue
+          columns={2}
+          items={[
+            {
+              label: 'Applicant reference',
+              value: <span className="break-all">{applicant.id}</span>,
+            },
+            { label: 'Current status', value: APPLICANT_STATUS_PILL[applicant.status].label },
+            {
+              label: 'Registration source',
+              value: REGISTRATION_SOURCE_LABELS[applicant.registrationSource ?? 'NOT_RECORDED'],
+            },
+            { label: 'Created', value: formatDateTime(applicant.createdAt) },
+            { label: 'Added by', value: applicant.registeredByName ?? 'Not recorded' },
+            {
+              label: 'Registration branch',
+              value: applicant.registrationBranchName ?? 'Not recorded',
+            },
+          ]}
+        />
+      </Card>
       <div className="grid gap-6 lg:grid-cols-2">
         <Card
           title="Identity"
@@ -1200,7 +1317,9 @@ export function ApplicantDetailView({
           </p>
           <div className="flex flex-wrap gap-2">
             {applicant.can.manage && <EditDetailsDialog applicant={applicant} />}
-            {applicant.can.manage && <ChangePhoneDialog applicant={applicant} />}
+            {applicant.can.manage && applicant.userId && (
+              <ChangePhoneDialog applicant={applicant} />
+            )}
             {applicant.can.transfer && applicant.branch && (
               <TransferDialog applicant={applicant} branches={branches} listPath={listPath} />
             )}

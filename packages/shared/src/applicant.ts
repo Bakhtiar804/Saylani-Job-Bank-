@@ -214,7 +214,15 @@ export type UpdatePersonalInput = z.infer<typeof updatePersonalSchema>;
 export const staffEditApplicantSchema = z
   .object(personalFields)
   .partial()
-  .extend({ reason: z.string().trim().min(5, 'Give a short reason').max(500) })
+  .extend({
+    reason: z.string().trim().min(5, 'Give a short reason').max(500),
+    contactPhone: z
+      .string()
+      .trim()
+      .regex(/^[+]923[0-9]{9}$/, 'Enter a Pakistani mobile contact number')
+      .nullable()
+      .optional(),
+  })
   .refine((v) => Object.keys(v).some((key) => key !== 'reason'), {
     message: 'Change at least one field',
   });
@@ -484,3 +492,29 @@ export function computeCompleteness(facts: ProfileFacts): Completeness {
     activationMissing: ACTIVATION_SECTIONS.filter((id) => !done[id]),
   };
 }
+/** Applicant acknowledgement recorded by staff in the immutable audit trail. */
+export const WALK_IN_CONSENT_VERSION = 'walk-in-registration-v1';
+export const WALK_IN_CONSENT_NOTICE =
+  'The applicant agrees to storing their manually provided information for Saylani Job Bank employment assistance.';
+
+/** No account, OTP, credential, document or resume input is accepted here. */
+export const staffRegisterApplicantSchema = registerApplicantSchema
+  .extend({
+    branchId: z.uuid().optional(),
+    consent: z.literal(true, 'Record the applicant consent before registering'),
+    contactPhone: z
+      .string()
+      .trim()
+      .max(30)
+      .nullish()
+      .transform((v) => v || null),
+    location: applicantLocationSchema.strict().optional(),
+    education: educationSchema.strict().optional(),
+    experience: experienceSchema.strict().optional(),
+    skills: skillsSchema.strict().optional(),
+    languages: languagesSchema.strict().optional(),
+    certifications: certificationsSchema.strict().optional(),
+    preferences: preferencesSchema.strict().optional(),
+  })
+  .strict();
+export type StaffRegisterApplicantInput = z.infer<typeof staffRegisterApplicantSchema>;

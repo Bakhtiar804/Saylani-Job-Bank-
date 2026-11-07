@@ -214,3 +214,47 @@ export async function invalidateShortlistCache(jobId: string): Promise<void> {
     // cache trouble must never fail the write path; TTL (60s) bounds staleness
   }
 }
+
+/** Stored worker evidence only: this does not probe or claim live Python availability. */
+export async function getAssistedMatchState(
+  executor: DbExecutor,
+  applicant: { id: string; status: string; updatedAt: Date },
+  job: { id: string; status: string; updatedAt: Date },
+) {
+  const [run] = await executor
+    .select()
+    .from(mr)
+    .where(eq(mr.jobId, job.id))
+    .orderBy(desc(mr.createdAt), desc(mr.id))
+    .limit(1);
+  const [queued] = await executor
+    .select({ createdAt: mo.createdAt })
+    .from(mo)
+    .where(and(eq(mo.dedupeKey, job.id), eq(mo.status, 'PENDING')))
+    .orderBy(desc(mo.createdAt))
+    .limit(1);
+  const pending = !!queued && (!run?.completedAt || queued.createdAt > run.completedAt);
+  let status: string = run?.status ?? 'NOT_RUN';
+  let eligible = false;
+  if (applicant.status !== 'ACTIVE' || job.status !== 'OPEN') status = 'PROFILE_OR_JOB_NOT_READY';
+  else if (pending && run?.status !== 'RUNNING') status = 'PENDING';
+  else if (run?.status === 'COMPLETED') {
+    const evaluatedAt = run.startedAt ?? run.createdAt;
+    if (evaluatedAt < applicant.updatedAt || evaluatedAt < job.updatedAt) status = 'STALE';
+    else {
+      const [match] = await executor
+        .select()
+        .from(jm)
+        .where(and(eq(jm.runId, run.id), eq(jm.applicantId, applicant.id), eq(jm.jobId, job.id)))
+        .limit(1);
+      eligible = !!match && match.score !== null && match.reviewStatus !== 'REJECTED';
+      status = eligible ? 'ELIGIBLE_RECORDED_MATCH' : 'NO_ELIGIBLE_RECORDED_MATCH';
+    }
+  }
+  return {
+    status,
+    eligible,
+    completedAt: run?.completedAt?.toISOString() ?? null,
+    liveServiceStatus: 'NOT_CHECKED' as const,
+  };
+}

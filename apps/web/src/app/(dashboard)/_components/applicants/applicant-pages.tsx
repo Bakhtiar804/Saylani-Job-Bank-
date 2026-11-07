@@ -1,11 +1,12 @@
 import type { Role } from '@jobbank/shared';
-import { StatusPill } from '@/components/atoms';
+import { Button, Link, StatusPill } from '@/components/atoms';
 import { DetailPageLayout } from '@/components/templates';
 import {
   APPLICANT_SORTABLE,
   applicantFilters,
   getApplicantForStaff,
   listApplicants,
+  listApplicantCreators,
 } from '@/domains/applicant';
 import { requireRole } from '@/domains/auth';
 import { listBranches, listBranchOptions } from '@/domains/branch';
@@ -13,7 +14,7 @@ import { listApplicationsForApplicant } from '@/domains/placement';
 import { listMasterData } from '@/domains/settings';
 import { ValidationError } from '@/domains/shared/errors';
 import { parseListQuery } from '@/domains/shared/pagination';
-import { isSuperAdmin } from '@/domains/shared/scope';
+import { cityScope, hasPermission, isSuperAdmin } from '@/domains/shared/scope';
 import { db } from '@/lib/db';
 import { schema } from '@jobbank/db';
 import { and, eq, sql } from 'drizzle-orm';
@@ -52,10 +53,11 @@ export async function ApplicantListPage({
     if (!(error instanceof ValidationError)) throw error;
     query = parseListQuery(new URLSearchParams(), listOptions);
   }
-  const [{ data, meta }, branches, skills] = await Promise.all([
+  const [{ data, meta }, branches, skills, creators] = await Promise.all([
     loadForPage(actor, () => listApplicants(actor, query)),
     listBranches(actor),
     listMasterData(actor, { type: 'SKILL' }),
+    listApplicantCreators(actor),
   ]);
 
   return (
@@ -67,8 +69,22 @@ export async function ApplicantListPage({
             ? 'Job seekers across all branches. Use the branch switcher to focus on one branch.'
             : 'Job seekers registered with your branch.'}
         </p>
+        {(role === 'STAFF' || role === 'BRANCH_ADMIN') &&
+          hasPermission(actor, 'applicant:manage') && (
+            <div className="mt-3">
+              <Button asChild>
+                <Link
+                  href={role === 'STAFF' ? '/staff/applicants/new' : '/branch-admin/applicants/new'}
+                  variant="unstyled"
+                >
+                  Add Walk-in Job Seeker
+                </Link>
+              </Button>
+            </div>
+          )}
       </header>
       <ApplicantsTable
+        creators={creators.map((c) => ({ value: c.id, label: c.name }))}
         rows={data}
         meta={meta}
         sort={{ id: query.sort.field, direction: query.sort.direction }}
@@ -105,6 +121,7 @@ export async function ApplicantDetailPage({
           .innerJoin(schema.jobLocations, eq(schema.jobs.id, schema.jobLocations.jobId))
           .where(
             and(
+              cityScope(actor, schema.jobs.branchId),
               eq(schema.jobs.status, 'OPEN'),
               sql`upper(${schema.jobLocations.cityCode}) = upper(${applicant.address.cityCode})`,
             ),
@@ -119,7 +136,7 @@ export async function ApplicantDetailPage({
       ? listBranchOptions(applicant.address?.location ?? { lat: 30.3753, lng: 69.3451 })
       : Promise.resolve([]),
     openJobsPromise,
-    applicant.can.shortlist
+    hasPermission(actor, 'match_case:read')
       ? listApplicationsForApplicant(actor, applicant.id)
       : Promise.resolve([]),
   ]);

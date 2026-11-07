@@ -26,3 +26,9 @@ export const DOCUMENT_STATUS_PILL: Partial<Record<ApplicantDocumentStatus, Pill>
   ACCEPTED: { label: 'Accepted', tone: 'success' },
   REJECTED: { label: 'Not accepted', tone: 'danger' },
 };
+
+export const REGISTRATION_SOURCE_LABELS = {
+  SELF: 'Self-registration',
+  STAFF_ASSISTED: 'Staff-assisted',
+  NOT_RECORDED: 'Not recorded',
+} as const;

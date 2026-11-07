@@ -3,6 +3,7 @@
 export {
   enqueueJobMatch,
   getLatestJobMatches,
+  getAssistedMatchState,
   type JobMatchFactorView,
   type JobMatchView,
   type MatchesPage,
